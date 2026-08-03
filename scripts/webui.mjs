@@ -9,13 +9,21 @@
  * OpenAI/Anthropic API key — it drives the built OpenGame CLI over the ACP
  * backend (a locally installed Claude Code, spawned via acpmux).
  *
- * Flow:
- *   1. GET  /            → a page with a prompt box + "generate" button.
- *   2. POST /generate    → spawns `opengame -p "<prompt>" --yolo` with
- *                          OPENGAME_PROVIDER=acp in a fresh per-run workspace,
- *                          streams progress, and returns the generated game id.
- *   3. GET  /game/<id>/  → serves the generated game so the browser can play it
- *                          in an <iframe>.
+ * Generation takes a minute or two, so it runs as a BACKGROUND JOB rather than
+ * inside one long-held HTTP request (a long request drops on browser/proxy idle
+ * timeouts and the browser only sees a status-less `TypeError: network error`):
+ *   1. GET  /                → the page (prompt box + generate button + iframe).
+ *   2. POST /generate        → starts a job, returns { job_id } IMMEDIATELY.
+ *   3. GET  /status/<job_id> → the page polls this; returns ONLY page-safe fields
+ *                              { status, stage, message, diagnostic_id, game_url }.
+ *   4. GET  /game/<id>/...   → serves the generated game for the <iframe>.
+ *
+ * Error surface has two audiences (kept strictly separate):
+ *   - OPERATOR / server log: full detail — diagnostic_id, stage, exit code, and a
+ *     short error summary — enough to locate a failure.
+ *   - PAGE (a child is looking at it): ONLY a diagnostic_id + one plain sentence.
+ *     The provider name, subprocess stderr, exit code, filesystem paths, stack
+ *     traces, and the prompt are NEVER sent to the browser.
  *
  * This is a thin operator convenience on top of the already-merged ACP backend;
  * it does NOT change generation behavior. Usage:
@@ -34,15 +42,26 @@ import { fileURLToPath } from 'node:url';
 const PORT = Number(process.env['PORT'] || 8787);
 const HOST = process.env['HOST'] || '127.0.0.1';
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
-const CLI = join(REPO_ROOT, 'dist', 'cli.js');
+// The built CLI. Overridable via OPENGAME_WEBUI_CLI (used by the self-test to
+// point at a deliberately-failing program to exercise the failure surface).
+const CLI = process.env['OPENGAME_WEBUI_CLI'] || join(REPO_ROOT, 'dist', 'cli.js');
 // Which local coding agent acpmux should drive. Claude Code needs no proxy and
 // emits text chunks natively, so it is the default for this no-key path.
 const ACP_PROVIDER = process.env['OPENGAME_ACP_PROVIDER'] || 'claude';
 // A single generation can take a while (the agent plans + writes files).
-const GEN_TIMEOUT_MS = Number(process.env['OPENGAME_WEBUI_TIMEOUT_MS'] || 8 * 60 * 1000);
+const GEN_TIMEOUT_MS = Number(
+  process.env['OPENGAME_WEBUI_TIMEOUT_MS'] || 8 * 60 * 1000,
+);
 
-// In-memory registry of completed generations: id → workspace dir.
+// job_id → job record. `log` and `detail` are OPERATOR-ONLY (never sent to the
+// page). `stage`/`status`/`message`/`diagnosticId`/`gameUrl` are page-safe.
+const jobs = new Map();
+// game id → workspace dir (only registered on success).
 const games = new Map();
+
+// The ONLY message a child ever sees on failure. Deliberately generic — no
+// stage-specific or technical wording that could leak what went wrong.
+const CHILD_SAFE_FAILURE = '生成没成功，换句话再试一次吧。';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -64,6 +83,21 @@ const MIME = {
 function send(res, status, body, headers = {}) {
   res.writeHead(status, { 'Cache-Control': 'no-store', ...headers });
   res.end(body);
+}
+
+function sendJSON(res, status, obj) {
+  send(res, status, JSON.stringify(obj), {
+    'Content-Type': 'application/json; charset=utf-8',
+  });
+}
+
+// A short, unpredictable-enough id derived without Math.random (which the repo's
+// scripts sandbox forbids) — a monotonic counter mixed with high-res time.
+let idCounter = 0;
+function newId(prefix) {
+  idCounter += 1;
+  const t = process.hrtime.bigint().toString(36);
+  return `${prefix}-${t}-${idCounter.toString(36)}`;
 }
 
 const PAGE = `<!DOCTYPE html>
@@ -90,21 +124,21 @@ const PAGE = `<!DOCTYPE html>
   .examples { margin-top: 14px; font-size: 12px; color: #8a8a8a; }
   .examples button { background: #1b1f27; color: #cbd5e1; border: 1px solid #2a2f3a;
                      margin: 4px 4px 0 0; padding: 5px 8px; font-size: 12px; }
-  #log { margin-top: 16px; flex: 1; overflow: auto; background: #0b0d11; border: 1px solid #1c2129;
-         border-radius: 8px; padding: 10px; font: 12px/1.5 ui-monospace, Menlo, monospace;
-         white-space: pre-wrap; color: #9aa4b2; }
+  #note { margin-top: 16px; flex: 1; overflow: auto; background: #0b0d11; border: 1px solid #1c2129;
+          border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.6; color: #9aa4b2; }
   #frameWrap { flex: 1; display: flex; align-items: center; justify-content: center; background: #000; }
   iframe { width: 100%; height: 100%; border: 0; background: #000; }
   .placeholder { color: #55606e; font-size: 14px; }
   .bar { padding: 8px 12px; font-size: 12px; color: #8a8a8a; border-bottom: 1px solid #222;
          display: flex; gap: 12px; align-items: center; }
   .bar a { color: #60a5fa; text-decoration: none; }
+  .diag { color: #55606e; font-size: 11px; margin-top: 8px; }
 </style>
 </head>
 <body>
   <div id="left">
     <h1>用一句话做游戏</h1>
-    <p class="hint">输入你想要的游戏，点「生成」。后台用本地 Claude Code 生成，<b>不需要任何 API key</b>。</p>
+    <p class="hint">输入你想要的游戏，点「生成」。后台用本地 Claude Code 生成，<b>不需要任何 API key</b>。做一个游戏大概要一两分钟。</p>
     <textarea id="prompt" placeholder="例如：做一个躲避障碍物的小恐龙跳跃游戏，按空格跳，撞到就结束，右上角计分"></textarea>
     <button id="go">生成游戏</button>
     <div class="examples">
@@ -113,67 +147,94 @@ const PAGE = `<!DOCTYPE html>
       <button data-ex="做一个打砖块游戏，鼠标控制挡板，把所有砖块打掉就赢">打砖块</button>
       <button data-ex="做一个小恐龙跳跃躲障碍的游戏，空格跳跃，右上角显示分数">恐龙跳</button>
     </div>
-    <div id="log">准备就绪。</div>
+    <div id="note">准备好了，写一句你想玩的游戏吧。</div>
   </div>
   <div id="right">
     <div class="bar">
-      <span id="status">尚未生成</span>
+      <span id="status">还没开始</span>
       <a id="open" href="#" target="_blank" style="display:none">在新标签打开 ↗</a>
     </div>
-    <div id="frameWrap"><div class="placeholder">生成后游戏会显示在这里，可以直接玩</div></div>
+    <div id="frameWrap"><div class="placeholder">做好的游戏会显示在这里，可以直接玩</div></div>
   </div>
 <script>
   const $ = (s) => document.querySelector(s);
-  const logEl = $('#log');
-  function log(line) { logEl.textContent += '\\n' + line; logEl.scrollTop = logEl.scrollHeight; }
+  const noteEl = $('#note');
+  function note(text, diag) {
+    noteEl.textContent = text;
+    if (diag) {
+      const d = document.createElement('div');
+      d.className = 'diag';
+      d.textContent = '出问题时可以把这个编号告诉大人：' + diag;
+      noteEl.appendChild(d);
+    }
+  }
   document.querySelectorAll('.examples button').forEach((b) => {
     b.addEventListener('click', () => { $('#prompt').value = b.getAttribute('data-ex'); });
   });
+
+  let polling = false;
+  async function poll(jobId) {
+    while (polling) {
+      let s;
+      try {
+        const r = await fetch('/status/' + encodeURIComponent(jobId), { cache: 'no-store' });
+        s = await r.json();
+      } catch {
+        // A single failed poll is fine — the job runs on the server regardless.
+        await new Promise((r) => setTimeout(r, 1500));
+        continue;
+      }
+      if (s.status === 'running') {
+        $('#status').textContent = '正在做游戏…（大概一两分钟）';
+        note('本地 Claude 正在写游戏代码，请稍等一会儿。');
+        await new Promise((r) => setTimeout(r, 1500));
+        continue;
+      }
+      polling = false;
+      if (s.status === 'done' && s.game_url) {
+        $('#status').textContent = '做好啦 ✓';
+        note('游戏做好了，右边就能玩！');
+        $('#frameWrap').innerHTML =
+          '<iframe src="' + s.game_url + '" allow="autoplay; fullscreen"></iframe>';
+        const open = $('#open'); open.href = s.game_url; open.style.display = 'inline';
+      } else {
+        // Failure: show ONLY the safe message + a diagnostic id. No technical detail.
+        $('#status').textContent = '没成功';
+        note(s.message || '生成没成功，换句话再试一次吧。', s.diagnostic_id);
+      }
+      $('#go').disabled = false;
+    }
+  }
+
   $('#go').addEventListener('click', async () => {
     const prompt = $('#prompt').value.trim();
-    if (!prompt) { alert('先输入一句想要的游戏'); return; }
+    if (!prompt) { alert('先写一句你想玩的游戏'); return; }
     $('#go').disabled = true;
-    $('#status').textContent = '生成中…（本地 Claude 正在写代码，可能要一两分钟）';
-    logEl.textContent = '开始生成：' + prompt;
+    $('#status').textContent = '开始做游戏…';
+    note('正在启动…');
+    let jobId;
     try {
       const res = await fetch('/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt }),
       });
-      const reader = res.body.getReader();
-      const dec = new TextDecoder();
-      let buf = '';
-      let gameUrl = null;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        let nl;
-        while ((nl = buf.indexOf('\\n')) >= 0) {
-          const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
-          if (!line.trim()) continue;
-          let evt; try { evt = JSON.parse(line); } catch { continue; }
-          if (evt.type === 'log') log(evt.line);
-          else if (evt.type === 'done') { gameUrl = evt.url; }
-          else if (evt.type === 'error') { log('❌ ' + evt.message); }
-        }
+      const data = await res.json();
+      if (!res.ok || !data.job_id) {
+        $('#status').textContent = '没成功';
+        note(data.message || '暂时没法开始，等一下再试。', data.diagnostic_id);
+        $('#go').disabled = false;
+        return;
       }
-      if (gameUrl) {
-        $('#status').textContent = '生成完成 ✓';
-        $('#frameWrap').innerHTML = '<iframe src="' + gameUrl + '" allow="autoplay; fullscreen"></iframe>';
-        const open = $('#open'); open.href = gameUrl; open.style.display = 'inline';
-        log('✓ 完成，游戏已加载到右侧');
-      } else {
-        $('#status').textContent = '生成失败';
-        log('没有生成出可玩的游戏文件，看上面的日志。');
-      }
-    } catch (e) {
-      $('#status').textContent = '出错';
-      log('❌ ' + String(e));
-    } finally {
+      jobId = data.job_id;
+    } catch {
+      $('#status').textContent = '没成功';
+      note('连不上本地的小服务，确认它还开着，然后再试一次。');
       $('#go').disabled = false;
+      return;
     }
+    polling = true;
+    poll(jobId);
   });
 </script>
 </body>
@@ -182,7 +243,7 @@ const PAGE = `<!DOCTYPE html>
 /** Recursively find the entry HTML of a generated game under `dir`. Prefers a
  *  top-level index.html, else the shallowest *.html file. */
 async function findGameEntry(dir) {
-  let best = null; // { rel, depth }
+  let best = null; // { rel, score }
   async function walk(d, depth, relParts) {
     let entries;
     try {
@@ -206,53 +267,66 @@ async function findGameEntry(dir) {
   return best?.rel || null;
 }
 
-function writeEvent(res, obj) {
-  res.write(JSON.stringify(obj) + '\n');
+// ---- operator-side logging (never sent to the page) --------------------------
+function jobLog(job, line) {
+  job.log.push(line);
+  // Mirror to the server console so an operator can follow along / grep later.
+  console.log(`[${job.id}] ${line}`);
 }
 
-async function handleGenerate(req, res) {
-  const chunks = [];
-  for await (const c of req) chunks.push(c);
-  let prompt = '';
-  try {
-    prompt = String(JSON.parse(Buffer.concat(chunks).toString('utf8')).prompt || '').trim();
-  } catch {
-    return send(res, 400, 'bad json');
-  }
-  if (!prompt) return send(res, 400, 'empty prompt');
-  if (!existsSync(CLI)) {
-    return send(res, 500, `CLI not built at ${CLI}. Run: npm run build`);
-  }
+function failJob(job, stage, detail) {
+  job.status = 'failed';
+  job.stage = stage;
+  job.message = CHILD_SAFE_FAILURE; // page-safe, generic
+  job.detail = detail; // OPERATOR-ONLY
+  jobLog(job, `FAILED at stage=${stage}: ${detail}`);
+}
 
-  res.writeHead(200, {
-    'Content-Type': 'application/x-ndjson; charset=utf-8',
-    'Cache-Control': 'no-store',
-  });
+/** Start a generation job in the background. Returns the job record immediately;
+ *  the caller responds to the client without waiting for generation. */
+function startJob(prompt) {
+  const workspace = mkdtemp(join(tmpdir(), 'opengame-web-'));
+  const job = {
+    id: newId('gen'),
+    status: 'running',
+    stage: 'starting',
+    message: '',
+    detail: '',
+    gameUrl: null,
+    log: [],
+  };
+  jobs.set(job.id, job);
 
-  const workspace = await mkdtemp(join(tmpdir(), 'opengame-web-'));
-  const id = workspace.split(sep).pop();
-  writeEvent(res, { type: 'log', line: `工作目录：${workspace}` });
-  writeEvent(res, { type: 'log', line: `后端：ACP / ${ACP_PROVIDER}（无 API key）` });
+  workspace
+    .then((ws) => runGeneration(job, ws, prompt))
+    .catch((e) => failJob(job, job.stage || 'starting', `unexpected: ${String(e)}`));
+  return job;
+}
 
-  // Drive the built CLI headlessly through the ACP backend. No API key is set;
-  // the ACP path deliberately reads only OPENGAME_ACP_* (see contentGenerator.ts).
+function runGeneration(job, workspace, prompt) {
+  job.stage = 'generate';
+  jobLog(job, `workspace=${workspace}`);
+  jobLog(job, `backend=ACP/${ACP_PROVIDER} (no API key)`);
+
   const env = {
     ...process.env,
     OPENGAME_PROVIDER: 'acp',
     OPENGAME_ACP_PROVIDER: ACP_PROVIDER,
   };
-  const args = [CLI, '-p', prompt, '--yolo'];
-  const child = spawn(process.execPath, args, { cwd: workspace, env });
+  const child = spawn(process.execPath, [CLI, '-p', prompt, '--yolo'], {
+    cwd: workspace,
+    env,
+  });
 
-  let killedForTimeout = false;
+  let timedOut = false;
   const timer = setTimeout(() => {
-    killedForTimeout = true;
+    timedOut = true;
     child.kill('SIGKILL');
   }, GEN_TIMEOUT_MS);
 
   const relay = (buf) => {
     for (const line of buf.toString('utf8').split('\n')) {
-      if (line.trim()) writeEvent(res, { type: 'log', line });
+      if (line.trim()) jobLog(job, `cli: ${line}`);
     }
   };
   child.stdout.on('data', relay);
@@ -260,32 +334,93 @@ async function handleGenerate(req, res) {
 
   child.on('error', (e) => {
     clearTimeout(timer);
-    writeEvent(res, { type: 'error', message: `spawn failed: ${String(e)}` });
-    res.end();
+    // e.g. CLI binary missing / not executable.
+    failJob(job, 'generate', `spawn error: ${String(e)}`);
   });
 
   child.on('close', async (code) => {
     clearTimeout(timer);
-    if (killedForTimeout) {
-      writeEvent(res, { type: 'error', message: `生成超时（>${GEN_TIMEOUT_MS / 1000}s）` });
-      return res.end();
+    if (timedOut) {
+      failJob(job, 'generate', `timeout after ${GEN_TIMEOUT_MS}ms`);
+      return;
     }
-    const entry = await findGameEntry(workspace);
+    if (code !== 0) {
+      failJob(job, 'generate', `cli exited with code ${code}`);
+      return;
+    }
+    job.stage = 'collect';
+    let entry;
+    try {
+      entry = await findGameEntry(workspace);
+    } catch (e) {
+      failJob(job, 'collect', `scan error: ${String(e)}`);
+      return;
+    }
     if (!entry) {
-      writeEvent(res, {
-        type: 'error',
-        message: `未找到生成的 .html 游戏文件（CLI 退出码 ${code}）`,
-      });
-      return res.end();
+      failJob(job, 'collect', `no .html produced (cli exit ${code})`);
+      return;
     }
-    games.set(id, workspace);
-    writeEvent(res, { type: 'log', line: `生成文件：${entry}` });
-    writeEvent(res, { type: 'done', url: `/game/${id}/${entry}` });
-    res.end();
+    games.set(job.id, workspace);
+    job.status = 'done';
+    job.stage = 'done';
+    job.gameUrl = `/game/${job.id}/${entry}`;
+    jobLog(job, `game entry=${entry}`);
   });
 }
 
-async function handleGameAsset(req, res, url) {
+async function handleGenerate(req, res) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  let prompt = '';
+  try {
+    prompt = String(
+      JSON.parse(Buffer.concat(chunks).toString('utf8')).prompt || '',
+    ).trim();
+  } catch {
+    return sendJSON(res, 400, {
+      message: '请求格式不对，刷新页面再试一次。',
+      diagnostic_id: newId('req'),
+    });
+  }
+  if (!prompt) {
+    return sendJSON(res, 400, { message: '先写一句你想玩的游戏。' });
+  }
+  if (!existsSync(CLI)) {
+    const diagnosticId = newId('cfg');
+    console.log(
+      `[${diagnosticId}] CLI not built at ${CLI}; run \`npm run build\` first`,
+    );
+    // Page-safe wording; the path / build hint stays in the server log only.
+    return sendJSON(res, 503, {
+      message: '本地还没准备好，请先按说明构建一次，再试。',
+      diagnostic_id: diagnosticId,
+    });
+  }
+  const job = startJob(prompt);
+  // Respond IMMEDIATELY — generation continues in the background.
+  return sendJSON(res, 202, { job_id: job.id, status: 'running' });
+}
+
+function handleStatus(res, url) {
+  const jobId = decodeURIComponent(url.pathname.slice('/status/'.length));
+  const job = jobs.get(jobId);
+  if (!job) {
+    return sendJSON(res, 404, {
+      status: 'unknown',
+      message: '找不到这次生成，重新点一下生成吧。',
+    });
+  }
+  // ONLY page-safe fields. Never job.log / job.detail (operator-only).
+  return sendJSON(res, 200, {
+    status: job.status, // running | done | failed
+    stage: job.stage, // coarse label, no technical payload
+    message: job.message || '',
+    diagnostic_id: job.status === 'failed' ? job.id : undefined,
+    game_url: job.gameUrl || undefined,
+  });
+}
+
+async function handleGameAsset(res, url) {
   // /game/<id>/<relpath...>
   const rest = url.pathname.slice('/game/'.length);
   const slash = rest.indexOf('/');
@@ -315,24 +450,46 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
     if (req.method === 'GET' && url.pathname === '/') {
-      return send(res, 200, PAGE, { 'Content-Type': 'text/html; charset=utf-8' });
+      return send(res, 200, PAGE, {
+        'Content-Type': 'text/html; charset=utf-8',
+      });
     }
     if (req.method === 'POST' && url.pathname === '/generate') {
       return await handleGenerate(req, res);
     }
+    if (req.method === 'GET' && url.pathname.startsWith('/status/')) {
+      return handleStatus(res, url);
+    }
     if (req.method === 'GET' && url.pathname.startsWith('/game/')) {
-      return await handleGameAsset(req, res, url);
+      return await handleGameAsset(res, url);
     }
     return send(res, 404, 'not found');
   } catch (e) {
-    if (!res.headersSent) send(res, 500, `server error: ${String(e)}`);
-    else res.end();
+    // Last-resort catch: the page never sees this detail.
+    const diagnosticId = newId('srv');
+    console.log(`[${diagnosticId}] unhandled: ${String(e)}`);
+    if (!res.headersSent) {
+      sendJSON(res, 500, {
+        message: '出了点小问题，等一下再试。',
+        diagnostic_id: diagnosticId,
+      });
+    } else {
+      res.end();
+    }
   }
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`OpenGame web UI → http://${HOST}:${PORT}  (backend: ACP/${ACP_PROVIDER}, no API key)`);
+  console.log(
+    `OpenGame web UI → http://${HOST}:${PORT}  (backend: ACP/${ACP_PROVIDER}, no API key)`,
+  );
   if (!existsSync(CLI)) {
-    console.log(`⚠  CLI not built yet. Run \`npm run build\` first (expected ${CLI}).`);
+    console.log(
+      `⚠  CLI not built yet. Run \`npm run build\` first (expected ${CLI}).`,
+    );
   }
 });
+
+// Exported for the self-test (import without starting a second server is not
+// needed — the test drives the HTTP surface — but these help unit-level checks).
+export { CHILD_SAFE_FAILURE, newId };
