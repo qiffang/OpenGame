@@ -22,6 +22,8 @@ describe('validateNonInterActiveAuth', () => {
   let originalEnvQwenOauth: string | undefined;
   let originalEnvGoogleApiKey: string | undefined;
   let originalEnvAnthropicApiKey: string | undefined;
+  let originalEnvOpengameProvider: string | undefined;
+  let originalEnvOpengameAcpProvider: string | undefined;
   let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
   let processExitSpy: ReturnType<typeof vi.spyOn<[code?: number], never>>;
   let refreshAuthMock: ReturnType<typeof vi.fn>;
@@ -35,6 +37,8 @@ describe('validateNonInterActiveAuth', () => {
     originalEnvQwenOauth = process.env['QWEN_OAUTH'];
     originalEnvGoogleApiKey = process.env['GOOGLE_API_KEY'];
     originalEnvAnthropicApiKey = process.env['ANTHROPIC_API_KEY'];
+    originalEnvOpengameProvider = process.env['OPENGAME_PROVIDER'];
+    originalEnvOpengameAcpProvider = process.env['OPENGAME_ACP_PROVIDER'];
     delete process.env['GEMINI_API_KEY'];
     delete process.env['GOOGLE_GENAI_USE_VERTEXAI'];
     delete process.env['GOOGLE_GENAI_USE_GCA'];
@@ -42,6 +46,8 @@ describe('validateNonInterActiveAuth', () => {
     delete process.env['QWEN_OAUTH'];
     delete process.env['GOOGLE_API_KEY'];
     delete process.env['ANTHROPIC_API_KEY'];
+    delete process.env['OPENGAME_PROVIDER'];
+    delete process.env['OPENGAME_ACP_PROVIDER'];
     consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     processExitSpy = vi.spyOn(process, 'exit').mockImplementation((code) => {
       throw new Error(`process.exit(${code}) called`);
@@ -104,6 +110,16 @@ describe('validateNonInterActiveAuth', () => {
     } else {
       delete process.env['ANTHROPIC_API_KEY'];
     }
+    if (originalEnvOpengameProvider !== undefined) {
+      process.env['OPENGAME_PROVIDER'] = originalEnvOpengameProvider;
+    } else {
+      delete process.env['OPENGAME_PROVIDER'];
+    }
+    if (originalEnvOpengameAcpProvider !== undefined) {
+      process.env['OPENGAME_ACP_PROVIDER'] = originalEnvOpengameAcpProvider;
+    } else {
+      delete process.env['OPENGAME_ACP_PROVIDER'];
+    }
     vi.restoreAllMocks();
   });
 
@@ -148,6 +164,46 @@ describe('validateNonInterActiveAuth', () => {
       mockSettings,
     );
     expect(refreshAuthMock).toHaveBeenCalledWith(AuthType.USE_OPENAI);
+  });
+
+  it('uses USE_ACP when OPENGAME_PROVIDER=acp even if a (bogus) OPENAI_API_KEY is set', async () => {
+    // Contract #1 at the CLI layer: an explicit ACP choice must NOT be stolen by
+    // a stray hosted-API key.
+    process.env['OPENGAME_PROVIDER'] = 'acp';
+    process.env['OPENAI_API_KEY'] = 'sk-bogus-should-not-win';
+    const nonInteractiveConfig = {
+      refreshAuth: refreshAuthMock,
+      getOutputFormat: vi.fn().mockReturnValue(OutputFormat.TEXT),
+      getContentGeneratorConfig: vi
+        .fn()
+        .mockReturnValue({ authType: undefined }),
+    } as unknown as Config;
+    await validateNonInteractiveAuth(
+      undefined,
+      undefined,
+      nonInteractiveConfig,
+      mockSettings,
+    );
+    expect(refreshAuthMock).toHaveBeenCalledWith(AuthType.USE_ACP);
+    expect(refreshAuthMock).not.toHaveBeenCalledWith(AuthType.USE_OPENAI);
+  });
+
+  it('uses USE_ACP when OPENGAME_ACP_PROVIDER is set (no OpenAI key present)', async () => {
+    process.env['OPENGAME_ACP_PROVIDER'] = 'codex';
+    const nonInteractiveConfig = {
+      refreshAuth: refreshAuthMock,
+      getOutputFormat: vi.fn().mockReturnValue(OutputFormat.TEXT),
+      getContentGeneratorConfig: vi
+        .fn()
+        .mockReturnValue({ authType: undefined }),
+    } as unknown as Config;
+    await validateNonInteractiveAuth(
+      undefined,
+      undefined,
+      nonInteractiveConfig,
+      mockSettings,
+    );
+    expect(refreshAuthMock).toHaveBeenCalledWith(AuthType.USE_ACP);
   });
 
   it('uses configured QWEN_OAUTH if provided', async () => {
