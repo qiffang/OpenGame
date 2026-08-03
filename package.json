@@ -102,6 +102,7 @@
     "mock-fs": "^5.5.0",
     "msw": "^2.10.4",
     "npm-run-all": "^4.1.5",
+    "playwright": "^1.62.1",
     "prettier": "^3.5.3",
     "react-devtools-core": "^7.0.1",
     "semver": "^7.7.2",

@@ -1,0 +1,10 @@
+<!doctype html><html><body><canvas id="c" width="300" height="150"></canvas>
+<script>
+const x=document.getElementById('c').getContext('2d');let f=0;
+function loop(){f++;x.clearRect(0,0,300,150);x.fillStyle='#08f';
+// position advances slowly and deterministically by frame count
+x.fillRect((Math.floor(f/3)*4)%280,60,20,20);x.fillStyle='#fff';x.fillRect(5,5,3,3);
+requestAnimationFrame(loop);}
+requestAnimationFrame(loop);
+/* deterministic animation by frame count, NO key handler */
+</script></body></html>
