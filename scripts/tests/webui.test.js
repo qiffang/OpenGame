@@ -41,10 +41,13 @@ afterEach(() => {
 // A tiny "CLI" that always exits non-zero and prints a technical-looking error
 // to stderr — exactly the kind of detail that must NOT reach the page.
 const brokenCli = join(here, 'fixtures-webui-broken-cli.mjs');
+// A "CLI" that never exits, to exercise the timeout path.
+const hangCli = join(here, 'fixtures-webui-hang-cli.mjs');
 
-/** Start the webui server pointed at a deliberately-failing CLI so every
- *  generation fails at the generate stage. Returns { base }. */
-async function startServer(port) {
+/** Start the webui server. By default it points at a deliberately-failing CLI so
+ *  every generation fails at the generate stage. Pass { cli, timeoutMs } to
+ *  override. Returns { base }. */
+async function startServer(port, opts = {}) {
   proc = spawn(process.execPath, [webui], {
     env: {
       ...process.env,
@@ -52,7 +55,10 @@ async function startServer(port) {
       HOST: '127.0.0.1',
       // Override the CLI with a program that exits non-zero → generate-stage
       // failure, deterministically, without needing a real build.
-      OPENGAME_WEBUI_CLI: brokenCli,
+      OPENGAME_WEBUI_CLI: opts.cli || brokenCli,
+      ...(opts.timeoutMs
+        ? { OPENGAME_WEBUI_TIMEOUT_MS: String(opts.timeoutMs) }
+        : {}),
     },
     stdio: 'ignore',
   });
@@ -131,6 +137,27 @@ describe('webui error surface is child-safe', () => {
     expect(typeof terminal.message).toBe('string');
     expect(terminal.message.length).toBeGreaterThan(0);
   }, 60000);
+
+  it('a generation that hangs is SIGKILLed at the timeout and lands child-safe', async () => {
+    // CLI never exits; a 1s timeout forces the server to SIGKILL it and fail the
+    // job. The job must reach a terminal (failed) state — not poll forever — and
+    // still leak no technical detail to the page.
+    const { base } = await startServer(8794, { cli: hangCli, timeoutMs: 1000 });
+    const res = await fetch(base + '/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: 'make a game' }),
+    });
+    const data = await res.json();
+    expect(res.status).toBe(202);
+    const terminal = await pollUntilTerminal(base, data.job_id, 20000);
+    expect(terminal.status).toBe('failed');
+    const blob = JSON.stringify(terminal).toLowerCase();
+    for (const forbidden of FORBIDDEN_ON_PAGE) {
+      expect(blob).not.toContain(forbidden.toLowerCase());
+    }
+    expect(terminal.message.length).toBeGreaterThan(0);
+  }, 40000);
 
   it('an unknown job id returns a clean not-found message', async () => {
     const { base } = await startServer(8793);
