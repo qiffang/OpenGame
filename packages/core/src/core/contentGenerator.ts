@@ -86,6 +86,9 @@ export type ContentGeneratorConfig = {
     provider: string;
     // Path to the acpmux binary (defaults to 'acpmux' on PATH).
     acpmuxPath: string;
+    // Explicit model override (OPENGAME_ACP_MODEL) or undefined to use the
+    // agent's own default. Never the provider name.
+    model?: string;
   };
 };
 
@@ -126,21 +129,28 @@ export function createContentGeneratorConfig(
         `Unsupported OPENGAME_ACP_PROVIDER: ${provider}. Expected 'codex' or 'claude'.`,
       );
     }
+    // The ACP model override is ONLY the explicitly-configured OPENGAME_ACP_MODEL.
+    // We must NOT fall back to the provider name ('codex'/'claude') — that is not a
+    // real model, and sending session/set_config_option(model='codex') makes the
+    // agent try to use a model literally named "codex" and the turn errors. When no
+    // model is set, we leave it undefined so the transport skips set_config_option
+    // and the agent uses its own default model.
+    const acpModel = process.env['OPENGAME_ACP_MODEL'] || undefined;
     return {
       ...newContentGeneratorConfig,
       // No apiKey / baseUrl on this path.
       apiKey: undefined,
       baseUrl: undefined,
-      model:
-        newContentGeneratorConfig.model ||
-        process.env['OPENGAME_ACP_MODEL'] ||
-        provider,
+      // Top-level model is a display/config label only (some call sites read it);
+      // it is NOT sent to the agent unless acp.model is set.
+      model: newContentGeneratorConfig.model || acpModel || provider,
       acp: {
         provider,
         acpmuxPath:
           newContentGeneratorConfig.acp?.acpmuxPath ||
           process.env['OPENGAME_ACPMUX_PATH'] ||
           'acpmux',
+        model: acpModel,
       },
     } as ContentGeneratorConfig;
   }

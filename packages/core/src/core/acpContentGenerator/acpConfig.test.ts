@@ -68,13 +68,21 @@ describe('createContentGeneratorConfig — ACP no-key gate (contract #1)', () =>
     expect(cfg.acp?.acpmuxPath).toBe('acpmux');
   });
 
-  it('honors OPENGAME_ACPMUX_PATH and OPENGAME_ACP_MODEL', () => {
+  it('does NOT set acp.model to the provider name (no OPENGAME_ACP_MODEL)', () => {
+    // Regression: acp.model must be undefined when no explicit model is set — NOT
+    // the provider name 'codex'. Sending set_config_option(model='codex') makes the
+    // agent try to use a model literally named "codex" and the turn errors.
+    const cfg = createContentGeneratorConfig(fakeConfig, AuthType.USE_ACP);
+    expect(cfg.acp?.model).toBeUndefined();
+  });
+
+  it('sets acp.model ONLY from OPENGAME_ACP_MODEL when explicitly configured', () => {
     process.env['OPENGAME_ACP_PROVIDER'] = 'claude';
     process.env['OPENGAME_ACPMUX_PATH'] = '/opt/acpmux';
     process.env['OPENGAME_ACP_MODEL'] = 'claude-sonnet';
     const cfg = createContentGeneratorConfig(fakeConfig, AuthType.USE_ACP);
     expect(cfg.acp?.acpmuxPath).toBe('/opt/acpmux');
-    expect(cfg.model).toBe('claude-sonnet');
+    expect(cfg.acp?.model).toBe('claude-sonnet');
   });
 
   it('fails closed on an unsupported provider (no silent fallback)', () => {
