@@ -24,6 +24,7 @@
  * Exit 0 = PASS, 1 = FAIL. Prints a JSON result to stdout.
  */
 
+/* global window, document */
 import { chromium } from 'playwright';
 import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
