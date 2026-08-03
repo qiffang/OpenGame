@@ -23,8 +23,15 @@ import {
   createInterface,
   type Interface as ReadlineInterface,
 } from 'node:readline';
-import { resolve as pathResolve, sep as pathSep } from 'node:path';
-import { readFile, writeFile } from 'node:fs/promises';
+import { resolve as pathResolve, sep as pathSep, dirname } from 'node:path';
+import { readFile, writeFile, realpath } from 'node:fs/promises';
+
+/**
+ * Policy for answering the agent's session/request_permission. Default 'allow'
+ * (the agent runs under acpmux with its own sandbox); set 'deny' to refuse, which
+ * returns a cancelled outcome so the provider can fail-converge instead of hang.
+ */
+export type ACPPermissionPolicy = 'allow' | 'deny';
 
 /** Categories a caller can map to a diagnostic. Stable troubleshooting contract. */
 export type ACPFailureCategory =
@@ -69,6 +76,8 @@ export interface ACPTransportConfig {
   cwd: string;
   /** Optional model name; applied via session/set_config_option after session/new. */
   model?: string;
+  /** How to answer agent permission requests. Default 'allow'. */
+  permissionPolicy?: ACPPermissionPolicy;
 }
 
 /** Reads text-file content on behalf of the agent, scoped to the turn's cwd. */
@@ -265,21 +274,32 @@ export class ACPTurn {
     try {
       let result: unknown;
       if (method === 'session/request_permission') {
-        // Grant: acpmux/the agent enforces its own tool/permission policy; our job
-        // is to not deadlock. Shape mirrors ACP's selected-option outcome.
+        // Explicit policy (default 'allow'; 'deny' refuses). We never hang: either
+        // path returns a concrete outcome. acpmux/the agent still enforces its own
+        // sandbox — this only decides our answer.
+        const policy = this.config.permissionPolicy ?? 'allow';
         const options =
           (params['options'] as Array<{ optionId?: string }>) ?? [];
-        const allow =
-          options.find((o) => /allow|grant|yes|approve/i.test(o.optionId ?? ''))
-            ?.optionId ?? options[0]?.optionId;
-        result = allow
-          ? { outcome: { outcome: 'selected', optionId: allow } }
-          : { outcome: { outcome: 'cancelled' } };
+        if (policy === 'deny') {
+          this.#log(`permission: DENY (policy=deny)`);
+          result = { outcome: { outcome: 'cancelled' } };
+        } else {
+          const allow =
+            options.find((o) =>
+              /allow|grant|yes|approve/i.test(o.optionId ?? ''),
+            )?.optionId ?? options[0]?.optionId;
+          this.#log(
+            `permission: ${allow ? `ALLOW ${allow}` : 'CANCEL (no option)'}`,
+          );
+          result = allow
+            ? { outcome: { outcome: 'selected', optionId: allow } }
+            : { outcome: { outcome: 'cancelled' } };
+        }
       } else if (method === 'fs/read_text_file') {
-        const p = this.#resolveInCwd(String(params['path'] ?? ''));
+        const p = await this.#resolveInCwd(String(params['path'] ?? ''));
         result = { content: await this.#fsReader(p) };
       } else if (method === 'fs/write_text_file') {
-        const p = this.#resolveInCwd(String(params['path'] ?? ''));
+        const p = await this.#resolveInCwd(String(params['path'] ?? ''));
         await this.#fsWriter(p, String(params['content'] ?? ''));
         result = {};
       } else {
@@ -299,14 +319,52 @@ export class ACPTurn {
     }
   }
 
-  #resolveInCwd(p: string): string {
-    // Deny escaping the turn's cwd (path traversal / absolute outside cwd).
-    const resolved = pathResolve(this.config.cwd, p);
-    const base = pathResolve(this.config.cwd);
-    if (resolved !== base && !resolved.startsWith(base + pathSep)) {
-      throw new ACPError('turn_failed', `path escapes cwd: ${p}`);
+  /**
+   * Resolve a path the agent asked us to read/write and confirm it stays inside
+   * the turn's workspace — with SYMLINK safety, not just a string-prefix check.
+   * A string check alone lets a symlink inside cwd point outside it; we realpath
+   * the deepest existing ancestor so a symlink escape is rejected. Absolute paths,
+   * `..` traversal, and symlink escapes all throw (the caller returns a JSON-RPC
+   * error so the provider fail-converges instead of hanging).
+   */
+  async #resolveInCwd(p: string): Promise<string> {
+    const baseReal = await realpath(pathResolve(this.config.cwd));
+    const candidate = pathResolve(this.config.cwd, p);
+
+    // Realpath the nearest existing ancestor (the target itself may not exist yet
+    // for a write). This resolves any symlink components along the way.
+    let probe = candidate;
+     
+    while (true) {
+      try {
+        const real = await realpath(probe);
+        // Re-attach the not-yet-existing tail to the resolved ancestor.
+        const tail = candidate.slice(probe.length);
+        const finalReal = pathResolve(real + tail);
+        if (
+          finalReal !== baseReal &&
+          !finalReal.startsWith(baseReal + pathSep)
+        ) {
+          throw new ACPError('turn_failed', `path escapes workspace: ${p}`);
+        }
+        return finalReal;
+      } catch (err) {
+        if (err instanceof ACPError) throw err;
+        const parent = dirname(probe);
+        if (parent === probe) {
+          throw new ACPError('turn_failed', `cannot resolve path: ${p}`);
+        }
+        probe = parent;
+      }
     }
-    return resolved;
+  }
+
+  #log(message: string): void {
+    // Bounded, non-secret breadcrumb for troubleshooting the reverse-RPC path.
+    if (process.env['OPENGAME_ACP_DEBUG']) {
+       
+      console.error(`[acp] ${message}`);
+    }
   }
 
   #respond(
