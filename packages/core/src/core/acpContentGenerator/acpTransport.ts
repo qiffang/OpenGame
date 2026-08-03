@@ -23,6 +23,8 @@ import {
   createInterface,
   type Interface as ReadlineInterface,
 } from 'node:readline';
+import { resolve as pathResolve, sep as pathSep } from 'node:path';
+import { readFile, writeFile } from 'node:fs/promises';
 
 /** Categories a caller can map to a diagnostic. Stable troubleshooting contract. */
 export type ACPFailureCategory =
@@ -65,7 +67,14 @@ export interface ACPTransportConfig {
   provider: string; // 'codex' | 'claude'
   acpmuxPath: string; // path or bare 'acpmux'
   cwd: string;
+  /** Optional model name; applied via session/set_config_option after session/new. */
+  model?: string;
 }
+
+/** Reads text-file content on behalf of the agent, scoped to the turn's cwd. */
+type FsReader = (path: string) => Promise<string>;
+/** Writes text-file content on behalf of the agent, scoped to the turn's cwd. */
+type FsWriter = (path: string, content: string) => Promise<void>;
 
 /**
  * Runs a single ACP turn: spawn → initialize → session/new → session/prompt.
@@ -89,8 +98,18 @@ export class ACPTurn {
     (method: string, params: Record<string, unknown>) => void
   > = [];
   #closed = false;
+  readonly #fsReader: FsReader;
+  readonly #fsWriter: FsWriter;
 
-  constructor(private readonly config: ACPTransportConfig) {}
+  constructor(
+    private readonly config: ACPTransportConfig,
+    // Overridable for tests; default to real fs (paths are pre-scoped to cwd).
+    fs?: { read?: FsReader; write?: FsWriter },
+  ) {
+    this.#fsReader = fs?.read ?? ((p) => readFile(p, 'utf8'));
+    this.#fsWriter =
+      fs?.write ?? ((p, c) => writeFile(p, c, 'utf8').then(() => undefined));
+  }
 
   async run(
     promptText: string,
@@ -107,6 +126,20 @@ export class ACPTurn {
       )) as {
         sessionId: string;
       };
+      // acpmux takes the model via session/set_config_option (configId "model"),
+      // NOT session/new — set it here so OPENGAME_ACP_MODEL actually reaches the
+      // agent instead of being silently dropped.
+      if (this.config.model) {
+        await this.#rpc(
+          'session/set_config_option',
+          {
+            sessionId: session.sessionId,
+            configId: 'model',
+            value: this.config.model,
+          },
+          signal,
+        );
+      }
       const stopReason = await this.#promptAndCollect(
         session.sessionId,
         promptText,
@@ -184,8 +217,10 @@ export class ACPTurn {
       // Non-JSON line on stdout — ignore (agents may print banners).
       return;
     }
+    // Response to one of OUR outbound requests: id + (result | error).
     if (
       msg.id !== undefined &&
+      msg.method === undefined &&
       (msg.result !== undefined || msg.error !== undefined)
     ) {
       const pending = this.#pending.get(msg.id);
@@ -200,9 +235,91 @@ export class ACPTurn {
       }
       return;
     }
-    if (msg.method && msg.params) {
-      for (const listener of this.#listeners) listener(msg.method, msg.params);
+    // INBOUND REQUEST from the agent (id + method): ACP is bidirectional — acpmux
+    // forwards session/request_permission, fs/read_text_file, fs/write_text_file
+    // FROM the agent and BLOCKS until we answer. Dropping these to the notification
+    // path (as before) hangs any permission-gated tool call the agent makes — which,
+    // under plan A (the agent runs its own tools), is the common case, not an edge.
+    if (msg.id !== undefined && msg.method) {
+      void this.#handleInboundRequest(msg.id, msg.method, msg.params ?? {});
+      return;
     }
+    // Notification (method, no id): e.g. session/update.
+    if (msg.method) {
+      for (const listener of this.#listeners)
+        listener(msg.method, msg.params ?? {});
+    }
+  }
+
+  /**
+   * Answer an agent→client request. We keep the client side minimal but correct:
+   * grant permission (the agent runs under acpmux with its own sandbox/config),
+   * and service fs read/write within the turn's cwd (path traversal outside cwd
+   * is denied). Every branch SENDS a response so the agent never blocks forever.
+   */
+  async #handleInboundRequest(
+    id: number | string,
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      let result: unknown;
+      if (method === 'session/request_permission') {
+        // Grant: acpmux/the agent enforces its own tool/permission policy; our job
+        // is to not deadlock. Shape mirrors ACP's selected-option outcome.
+        const options =
+          (params['options'] as Array<{ optionId?: string }>) ?? [];
+        const allow =
+          options.find((o) => /allow|grant|yes|approve/i.test(o.optionId ?? ''))
+            ?.optionId ?? options[0]?.optionId;
+        result = allow
+          ? { outcome: { outcome: 'selected', optionId: allow } }
+          : { outcome: { outcome: 'cancelled' } };
+      } else if (method === 'fs/read_text_file') {
+        const p = this.#resolveInCwd(String(params['path'] ?? ''));
+        result = { content: await this.#fsReader(p) };
+      } else if (method === 'fs/write_text_file') {
+        const p = this.#resolveInCwd(String(params['path'] ?? ''));
+        await this.#fsWriter(p, String(params['content'] ?? ''));
+        result = {};
+      } else {
+        // Unknown inbound request — respond with an error rather than hang.
+        this.#respond(id, undefined, {
+          code: -32601,
+          message: `unsupported request: ${method}`,
+        });
+        return;
+      }
+      this.#respond(id, result);
+    } catch (err) {
+      this.#respond(id, undefined, {
+        code: -32000,
+        message: err instanceof Error ? err.message : 'request failed',
+      });
+    }
+  }
+
+  #resolveInCwd(p: string): string {
+    // Deny escaping the turn's cwd (path traversal / absolute outside cwd).
+    const resolved = pathResolve(this.config.cwd, p);
+    const base = pathResolve(this.config.cwd);
+    if (resolved !== base && !resolved.startsWith(base + pathSep)) {
+      throw new ACPError('turn_failed', `path escapes cwd: ${p}`);
+    }
+    return resolved;
+  }
+
+  #respond(
+    id: number | string,
+    result?: unknown,
+    error?: { code: number; message: string },
+  ): void {
+    if (!this.#child?.stdin?.writable) return;
+    const msg =
+      error !== undefined
+        ? { jsonrpc: '2.0', id, error }
+        : { jsonrpc: '2.0', id, result: result ?? {} };
+    this.#child.stdin.write(JSON.stringify(msg) + '\n');
   }
 
   async #initialize(signal?: AbortSignal): Promise<void> {
@@ -281,12 +398,27 @@ export class ACPTurn {
           if (settled) return;
           cleanup();
           const stopReason = (result as Record<string, unknown>)?.stopReason;
-          if (stopReason === 'error') {
+          // Fail-closed: ONLY an explicit successful end is a success. A
+          // `cancelled`, `error`, missing, or unknown stopReason must NOT be
+          // returned as a normal completion (that would misreport an interrupted
+          // or malformed turn as a successful generation).
+          if (stopReason === 'end_turn') {
+            resolve('end_turn');
+          } else if (stopReason === 'cancelled') {
+            reject(
+              new ACPError('timeout_or_cancelled', 'ACP turn was cancelled.'),
+            );
+          } else if (stopReason === 'error') {
             reject(
               new ACPError('turn_failed', 'ACP turn ended with an error.'),
             );
           } else {
-            resolve(typeof stopReason === 'string' ? stopReason : 'end_turn');
+            reject(
+              new ACPError(
+                'malformed_response',
+                `ACP turn returned an unexpected stopReason: ${String(stopReason)}`,
+              ),
+            );
           }
         })
         .catch((err) => {

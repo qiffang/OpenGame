@@ -62,6 +62,7 @@ export class ACPContentGenerator implements ContentGenerator {
       provider: acp.provider,
       acpmuxPath: acp.acpmuxPath,
       cwd: this.gcConfig.getWorkingDir(),
+      model: this.config.model,
     });
 
     const abortSignal = (request.config as { abortSignal?: AbortSignal })
@@ -82,6 +83,7 @@ export class ACPContentGenerator implements ContentGenerator {
     const acp = this.acp();
     const prompt = flattenRequestToPrompt(request);
     const cwd = this.gcConfig.getWorkingDir();
+    const model = this.config.model;
     const abortSignal = (request.config as { abortSignal?: AbortSignal })
       ?.abortSignal;
 
@@ -97,6 +99,7 @@ export class ACPContentGenerator implements ContentGenerator {
         provider: acp.provider,
         acpmuxPath: acp.acpmuxPath,
         cwd,
+        model,
       });
       const runPromise = turn
         .run(

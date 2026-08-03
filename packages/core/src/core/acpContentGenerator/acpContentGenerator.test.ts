@@ -21,12 +21,34 @@ import type { Config } from '../../config/config.js';
  * text that LOOKS like a tool call — the point is that the ContentGenerator must
  * still surface them as plain text parts, never as Gemini functionCall parts.
  */
-function writeFakeAcpmux(chunks: string[]): string {
+interface FakeOpts {
+  chunks?: string[];
+  stopReason?: string; // default 'end_turn'
+  // If set, the agent sends a reverse session/request_permission and only
+  // completes the prompt AFTER the client answers it (proves we don't hang).
+  requestPermission?: boolean;
+}
+
+function writeFakeAcpmux(optsOrChunks: string[] | FakeOpts): string {
+  const opts: FakeOpts = Array.isArray(optsOrChunks)
+    ? { chunks: optsOrChunks }
+    : optsOrChunks;
   const dir = mkdtempSync(join(tmpdir(), 'acpmux-fake-'));
   const path = join(dir, 'acpmux');
   const script = `#!/usr/bin/env node
-const chunks = ${JSON.stringify(chunks)};
+const chunks = ${JSON.stringify(opts.chunks ?? [])};
+const stopReason = ${JSON.stringify(opts.stopReason ?? 'end_turn')};
+const requestPermission = ${JSON.stringify(!!opts.requestPermission)};
 let buf = '';
+let permId = 9001;
+let pendingPromptId = null;
+function finishPrompt() {
+  for (const text of chunks) {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } } } }) + '\\n');
+  }
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: pendingPromptId, result: { stopReason } }) + '\\n');
+  pendingPromptId = null;
+}
 process.stdin.on('data', (d) => {
   buf += d.toString();
   let i;
@@ -40,11 +62,19 @@ process.stdin.on('data', (d) => {
       process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } }) + '\\n');
     } else if (msg.method === 'session/new') {
       process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's1' } }) + '\\n');
+    } else if (msg.method === 'session/set_config_option') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
     } else if (msg.method === 'session/prompt') {
-      for (const text of chunks) {
-        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } } } }) + '\\n');
+      pendingPromptId = msg.id;
+      if (requestPermission) {
+        // Reverse request agent->client; block until client answers.
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: permId, method: 'session/request_permission', params: { sessionId: 's1', options: [{ optionId: 'allow' }, { optionId: 'reject' }] } }) + '\\n');
+      } else {
+        finishPrompt();
       }
-      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } }) + '\\n');
+    } else if (msg.id !== undefined && msg.method === undefined && (msg.result !== undefined || msg.error !== undefined)) {
+      // Client's response to our reverse request → now finish the prompt.
+      if (msg.id === permId && pendingPromptId !== null) finishPrompt();
     }
   }
 });
@@ -120,5 +150,43 @@ describe('ACPContentGenerator — plan A: agent-autonomous, no functionCall roun
     await expect(
       gen.embedContent({ model: 'codex', contents: [] } as never),
     ).rejects.toThrow(/not supported on the ACP backend/);
+  });
+
+  it('answers the agent reverse session/request_permission (does not hang)', async () => {
+    // Blocker 1: ACP is bidirectional — acpmux forwards session/request_permission
+    // FROM the agent and blocks until the client answers. The fake agent only
+    // completes the prompt AFTER we respond, so if the transport didn't answer the
+    // reverse request this test would hang (and time out) rather than resolve.
+    const acpmux = writeFakeAcpmux({
+      requestPermission: true,
+      chunks: ['done after permission'],
+    });
+    const gen = makeGenerator(acpmux);
+    const resp = await gen.generateContent(textRequest, 'p1');
+    const text = (resp.candidates?.[0]?.content?.parts ?? [])
+      .map((p) => (p as { text?: string }).text ?? '')
+      .join('');
+    expect(text).toContain('done after permission');
+  }, 15000);
+
+  it('fail-closed: a cancelled stopReason is an error, not a success', async () => {
+    // Blocker 2: cancelled / unknown stopReason must NOT return as a normal
+    // completion.
+    const acpmux = writeFakeAcpmux({ stopReason: 'cancelled', chunks: ['x'] });
+    const gen = makeGenerator(acpmux);
+    await expect(gen.generateContent(textRequest, 'p1')).rejects.toThrow(
+      /cancelled/i,
+    );
+  });
+
+  it('fail-closed: an unknown stopReason is a malformed_response error', async () => {
+    const acpmux = writeFakeAcpmux({
+      stopReason: 'weird_reason',
+      chunks: ['x'],
+    });
+    const gen = makeGenerator(acpmux);
+    await expect(gen.generateContent(textRequest, 'p1')).rejects.toThrow(
+      /unexpected stopReason/i,
+    );
   });
 });
