@@ -43,6 +43,11 @@ export enum AuthType {
   USE_GEMINI = 'gemini',
   USE_VERTEX_AI = 'vertex-ai',
   USE_ANTHROPIC = 'anthropic',
+  // Drive the LLM through an ACP (Agent Client Protocol) backend — a locally
+  // installed coding agent (Codex / Claude Code) spawned via acpmux — instead of
+  // a hosted HTTP API. This path deliberately requires NO OpenAI/Anthropic/Gemini
+  // API key: the local agent owns its own auth. See acpContentGenerator/.
+  USE_ACP = 'acp',
 }
 
 export type ContentGeneratorConfig = {
@@ -75,6 +80,13 @@ export type ContentGeneratorConfig = {
   userAgent?: string;
   // Schema compliance mode for tool definitions
   schemaCompliance?: 'auto' | 'openapi_30';
+  // ACP backend (AuthType.USE_ACP) settings. No API key is used on this path.
+  acp?: {
+    // Which local coding agent acpmux should drive: 'codex' | 'claude'.
+    provider: string;
+    // Path to the acpmux binary (defaults to 'acpmux' on PATH).
+    acpmuxPath: string;
+  };
 };
 
 export function createContentGeneratorConfig(
@@ -95,6 +107,41 @@ export function createContentGeneratorConfig(
       ...newContentGeneratorConfig,
       model: DEFAULT_QWEN_MODEL,
       apiKey: 'QWEN_OAUTH_DYNAMIC_TOKEN',
+    } as ContentGeneratorConfig;
+  }
+
+  if (authType === AuthType.USE_ACP) {
+    // ACP path: the local coding agent (Codex / Claude Code) owns its own auth,
+    // so we deliberately do NOT read or require OPENAI_API_KEY / OPENAI_BASE_URL /
+    // OPENAI_MODEL (or any other hosted-API key). Reading them here would let a
+    // stray key silently redirect us to a hosted API — exactly the failure this
+    // path exists to avoid. Configuration comes only from the ACP-specific env.
+    const provider = (
+      newContentGeneratorConfig.acp?.provider ||
+      process.env['OPENGAME_ACP_PROVIDER'] ||
+      'codex'
+    ).toLowerCase();
+    if (provider !== 'codex' && provider !== 'claude') {
+      throw new Error(
+        `Unsupported OPENGAME_ACP_PROVIDER: ${provider}. Expected 'codex' or 'claude'.`,
+      );
+    }
+    return {
+      ...newContentGeneratorConfig,
+      // No apiKey / baseUrl on this path.
+      apiKey: undefined,
+      baseUrl: undefined,
+      model:
+        newContentGeneratorConfig.model ||
+        process.env['OPENGAME_ACP_MODEL'] ||
+        provider,
+      acp: {
+        provider,
+        acpmuxPath:
+          newContentGeneratorConfig.acp?.acpmuxPath ||
+          process.env['OPENGAME_ACPMUX_PATH'] ||
+          'acpmux',
+      },
     } as ContentGeneratorConfig;
   }
 
@@ -180,6 +227,15 @@ export async function createContentGenerator(
   gcConfig: Config,
   isInitialAuth?: boolean,
 ): Promise<ContentGenerator> {
+  if (config.authType === AuthType.USE_ACP) {
+    // ACP path: spawn a local coding agent (Codex / Claude Code) via acpmux.
+    // No API key is used or required here.
+    const { createACPContentGenerator } =
+      await import('./acpContentGenerator/index.js');
+    const generator = createACPContentGenerator(config, gcConfig);
+    return new LoggingContentGenerator(generator, gcConfig);
+  }
+
   if (config.authType === AuthType.USE_OPENAI) {
     if (!config.apiKey) {
       throw new Error('OPENAI_API_KEY environment variable not found.');
