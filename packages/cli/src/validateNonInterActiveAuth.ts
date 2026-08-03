@@ -14,6 +14,16 @@ import { StreamJsonOutputAdapter } from './nonInteractive/io/StreamJsonOutputAda
 import { runExitCleanup } from './utils/cleanup.js';
 
 function getAuthTypeFromEnv(): AuthType | undefined {
+  // ACP is selected explicitly and takes precedence: `OPENGAME_PROVIDER=acp`
+  // (or setting OPENGAME_ACP_PROVIDER) picks the local-agent backend even when a
+  // stray OPENAI_API_KEY is present — a hosted key must never silently override
+  // an explicit ACP choice.
+  if (
+    process.env['OPENGAME_PROVIDER']?.toLowerCase() === 'acp' ||
+    process.env['OPENGAME_ACP_PROVIDER']
+  ) {
+    return AuthType.USE_ACP;
+  }
   if (process.env['OPENAI_API_KEY']) {
     return AuthType.USE_OPENAI;
   }

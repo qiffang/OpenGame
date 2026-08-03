@@ -58,5 +58,17 @@ export function validateAuthMethod(authMethod: string): string | null {
     return null;
   }
 
+  if (authMethod === AuthType.USE_ACP) {
+    // ACP drives a local coding agent (Codex / Claude Code) via acpmux — no API
+    // key is required or read here. Only the provider name is validated.
+    const provider = (
+      process.env['OPENGAME_ACP_PROVIDER'] || 'codex'
+    ).toLowerCase();
+    if (provider !== 'codex' && provider !== 'claude') {
+      return `Unsupported OPENGAME_ACP_PROVIDER: ${provider}. Expected 'codex' or 'claude'.`;
+    }
+    return null;
+  }
+
   return 'Invalid auth method selected.';
 }
