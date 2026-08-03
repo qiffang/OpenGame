@@ -76,4 +76,19 @@ describe('liveness-gate PASSes a genuinely interactive game', () => {
     // With Math.random frozen, two no-input runs are ~identical.
     expect(out.noiseFloorFrames).toBeLessThan(out.inputDivergentFrames);
   }, 60000);
+
+  // This game drives ALL motion off the rAF `t` timestamp (and performance.now),
+  // not a fixed per-frame step. It locks the fix that the gate must feed the game
+  // a DETERMINISTIC virtual timestamp: with the real jittery `t`, two no-input
+  // runs would diverge and this genuinely interactive game would be FAILED.
+  it('PASSes a game whose motion is driven by the rAF timestamp', () => {
+    const { code, out } = runGate('interactive-game-timed.html');
+    expect(code).toBe(0);
+    expect(out.verdict).toBe('liveness+interactivity PASS');
+    expect(out.respondsToInput).toBe(true);
+    // The time-based animation must be deterministic run-to-run (noise floor 0),
+    // so ONLY the input causes divergence.
+    expect(out.noiseFloorFrames).toBe(0);
+    expect(out.inputDivergentFrames).toBeGreaterThan(0);
+  }, 60000);
 });

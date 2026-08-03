@@ -162,10 +162,16 @@ async function main() {
         return { fp: String(hash), drew: nonZero > 0 && seen.size > 1 };
       };
       window.requestAnimationFrame = (cb) =>
-        origRaf((t) => {
+        origRaf(() => {
           vt += step;
           window.__rafCount++;
-          const r = cb(t); // let the game draw this frame first
+          // Pass the DETERMINISTIC virtual timestamp to the game's callback, NOT
+          // the real one. A game that drives motion off the rAF `t` argument
+          // (requestAnimationFrame(t => ...)) would otherwise see real, jittery
+          // timestamps and diverge run-to-run — the same false-negative class as
+          // unseeded RNG. Feeding vt (which also backs performance.now/Date) keeps
+          // every time source consistent and every no-input run identical.
+          const r = cb(vt); // let the game draw this frame first
           window.__frames.push(fp()); // then fingerprint the result
           return r;
         });
