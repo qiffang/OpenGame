@@ -334,7 +334,7 @@ export class ACPTurn {
     // Realpath the nearest existing ancestor (the target itself may not exist yet
     // for a write). This resolves any symlink components along the way.
     let probe = candidate;
-     
+
     while (true) {
       try {
         const real = await realpath(probe);
@@ -362,7 +362,6 @@ export class ACPTurn {
   #log(message: string): void {
     // Bounded, non-secret breadcrumb for troubleshooting the reverse-RPC path.
     if (process.env['OPENGAME_ACP_DEBUG']) {
-       
       console.error(`[acp] ${message}`);
     }
   }
