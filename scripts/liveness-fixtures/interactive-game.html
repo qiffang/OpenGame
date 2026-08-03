@@ -1,0 +1,63 @@
+<!doctype html>
+<!--
+  POSITIVE fixture: a minimal but genuinely interactive game the gate MUST PASS.
+  Deliberately exercises the two hard cases the gate has to survive:
+    1. It has RNG (random falling dots) with NO fixed seed of its own — so WITHOUT
+       the gate freezing Math.random, two no-input runs would diverge and a real
+       game would be wrongly FAILED. This fixture locks that fix in.
+    2. It draws its FIRST frame inside requestAnimationFrame (nothing is drawn at
+       load) — so a gate that checks canvasDrawsPixels at load time would call it
+       blank. This locks the "check pixels after sampling" fix.
+  Interactivity: ArrowLeft/ArrowRight move a paddle, which changes the rendered
+  frame in a way a no-input run does not.
+-->
+<html lang="en">
+<head><meta charset="utf-8" /><title>interactive fixture</title></head>
+<body style="margin:0;background:#000">
+<canvas id="c" width="240" height="180"></canvas>
+<script>
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const paddle = { w: 60, h: 10, x: (W - 60) / 2, y: H - 16, speed: 8 };
+  const keys = { left: false, right: false };
+  const dots = [];
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft') keys.left = true;
+    if (e.key === 'ArrowRight') keys.right = true;
+  });
+  document.addEventListener('keyup', (e) => {
+    if (e.key === 'ArrowLeft') keys.left = false;
+    if (e.key === 'ArrowRight') keys.right = false;
+  });
+
+  function frame() {
+    // spawn random dots (RNG with no seed of its own)
+    if (dots.length < 30 && Math.random() < 0.6) {
+      dots.push({ x: Math.random() * W, y: 0, r: 2 + Math.random() * 3 });
+    }
+    for (const d of dots) d.y += 2 + Math.random() * 2;
+    while (dots.length && dots[0].y > H) dots.shift();
+
+    if (keys.left) paddle.x -= paddle.speed;
+    if (keys.right) paddle.x += paddle.speed;
+    paddle.x = Math.max(0, Math.min(W - paddle.w, paddle.x));
+
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#e8c547';
+    for (const d of dots) {
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = '#4fa3ff';
+    ctx.fillRect(paddle.x, paddle.y, paddle.w, paddle.h);
+    requestAnimationFrame(frame);
+  }
+  // First draw happens inside rAF, not at load.
+  requestAnimationFrame(frame);
+</script>
+</body>
+</html>

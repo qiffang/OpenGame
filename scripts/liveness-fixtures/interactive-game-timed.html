@@ -1,0 +1,60 @@
+<!doctype html>
+<!--
+  POSITIVE fixture #2: a genuinely interactive game that drives ALL of its motion
+  off the requestAnimationFrame `t` timestamp argument (and performance.now),
+  NOT a fixed per-frame step. This locks the fix that the gate must feed the game
+  a DETERMINISTIC virtual timestamp: if the gate passed the real rAF `t`, two
+  no-input runs would diverge (jittery timestamps → different positions) and this
+  genuinely interactive game would be wrongly FAILED — the same class as the
+  unseeded-RNG false-negative.
+
+  Interactivity: ArrowLeft/ArrowRight move a paddle; that change is visible on
+  every frame and a no-input run does not produce it.
+-->
+<html lang="en">
+<head><meta charset="utf-8" /><title>timed interactive fixture</title></head>
+<body style="margin:0;background:#000">
+<canvas id="c" width="240" height="180"></canvas>
+<script>
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const paddle = { w: 60, h: 10, x: (W - 60) / 2, y: H - 16, speed: 0.25 };
+  const keys = { left: false, right: false };
+  let last = null;
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft') keys.left = true;
+    if (e.key === 'ArrowRight') keys.right = true;
+  });
+  document.addEventListener('keyup', (e) => {
+    if (e.key === 'ArrowLeft') keys.left = false;
+    if (e.key === 'ArrowRight') keys.right = false;
+  });
+
+  function frame(t) {
+    if (last === null) last = t;
+    const dt = t - last; // time-based motion: depends on the rAF timestamp
+    last = t;
+
+    // A moving element whose position is a function of elapsed time.
+    const orb = { x: (W / 2) + Math.sin(t / 300) * 80, y: 40, r: 8 };
+
+    if (keys.left) paddle.x -= paddle.speed * dt;
+    if (keys.right) paddle.x += paddle.speed * dt;
+    paddle.x = Math.max(0, Math.min(W - paddle.w, paddle.x));
+
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#e8c547';
+    ctx.beginPath();
+    ctx.arc(orb.x, orb.y, orb.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#4fa3ff';
+    ctx.fillRect(paddle.x, paddle.y, paddle.w, paddle.h);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+</script>
+</body>
+</html>

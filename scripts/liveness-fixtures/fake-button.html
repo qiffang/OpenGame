@@ -1,0 +1,9 @@
+<!doctype html><html><body><canvas id="c" width="300" height="150"></canvas>
+<script>
+const x=document.getElementById('c').getContext('2d');let f=0;
+function loop(){f++;x.clearRect(0,0,300,150);x.fillStyle='#333';x.fillRect(0,0,300,150);
+x.fillStyle='#0f0';x.fillRect(120,60,60,30);x.fillStyle='#fff';x.fillRect((Math.floor(f/3))%290,10,4,4);
+requestAnimationFrame(loop);}
+requestAnimationFrame(loop);
+document.querySelector('canvas').addEventListener('click',()=>{});/* handler does nothing */
+</script></body></html>
