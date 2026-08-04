@@ -86,6 +86,11 @@ export type ContentGeneratorConfig = {
     provider: string;
     // Path to the acpmux binary (defaults to 'acpmux' on PATH).
     acpmuxPath: string;
+    // Extra argv tokens passed to the selected acpmux provider via
+    // repeated --provider-arg flags.
+    providerArgs?: string[];
+    // ACP session mode to set after session/new, e.g. 'yolo'.
+    mode?: 'yolo';
     // Explicit model override (OPENGAME_ACP_MODEL) or undefined to use the
     // agent's own default. Never the provider name.
     model?: string;
@@ -136,6 +141,15 @@ export function createContentGeneratorConfig(
     // model is set, we leave it undefined so the transport skips set_config_option
     // and the agent uses its own default model.
     const acpModel = process.env['OPENGAME_ACP_MODEL'] || undefined;
+    const approvalMode = (
+      config as { getApprovalMode?: () => string } | undefined
+    )?.getApprovalMode?.();
+    const acpMode = approvalMode === 'yolo' ? 'yolo' : undefined;
+    const providerArgs =
+      newContentGeneratorConfig.acp?.providerArgs ??
+      (provider === 'claude' && acpMode === 'yolo'
+        ? ['--permission-mode', 'bypassPermissions']
+        : []);
     return {
       ...newContentGeneratorConfig,
       // No apiKey / baseUrl on this path.
@@ -150,6 +164,8 @@ export function createContentGeneratorConfig(
           newContentGeneratorConfig.acp?.acpmuxPath ||
           process.env['OPENGAME_ACPMUX_PATH'] ||
           'acpmux',
+        providerArgs,
+        mode: newContentGeneratorConfig.acp?.mode ?? acpMode,
         model: acpModel,
       },
     } as ContentGeneratorConfig;

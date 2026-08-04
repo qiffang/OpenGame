@@ -73,9 +73,13 @@ export interface ACPTextChunk {
 export interface ACPTransportConfig {
   provider: string; // 'codex' | 'claude'
   acpmuxPath: string; // path or bare 'acpmux'
+  /** Extra argv tokens passed to acpmux via repeated --provider-arg flags. */
+  providerArgs?: string[];
   cwd: string;
   /** Optional model name; applied via session/set_config_option after session/new. */
   model?: string;
+  /** Optional ACP mode; yolo auto-approves supported agent tools. */
+  mode?: 'yolo';
   /** How to answer agent permission requests. Default 'allow'. */
   permissionPolicy?: ACPPermissionPolicy;
 }
@@ -135,6 +139,16 @@ export class ACPTurn {
       )) as {
         sessionId: string;
       };
+      if (this.config.mode) {
+        await this.#rpc(
+          'session/set_mode',
+          {
+            sessionId: session.sessionId,
+            modeId: this.config.mode,
+          },
+          signal,
+        );
+      }
       // acpmux takes the model via session/set_config_option (configId "model"),
       // NOT session/new — set it here so OPENGAME_ACP_MODEL actually reaches the
       // agent instead of being silently dropped.
@@ -164,11 +178,14 @@ export class ACPTurn {
   #spawn(): void {
     let child: ChildProcess;
     try {
-      child = spawn(
-        this.config.acpmuxPath,
-        ['--provider', this.config.provider],
-        { shell: false, stdio: ['pipe', 'pipe', 'pipe'] },
-      );
+      const args = ['--provider', this.config.provider];
+      for (const arg of this.config.providerArgs ?? []) {
+        args.push('--provider-arg', arg);
+      }
+      child = spawn(this.config.acpmuxPath, args, {
+        shell: false,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
     } catch {
       throw new ACPError(
         'acpmux_not_found',

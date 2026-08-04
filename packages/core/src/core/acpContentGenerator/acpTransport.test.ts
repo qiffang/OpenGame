@@ -28,6 +28,8 @@ function writeFakeAcpmux(reverse: {
   params: Record<string, unknown>;
   respFile: string;
   orderFile: string;
+  argsFile?: string;
+  requestsFile?: string;
 }): string {
   const dir = mkdtempSync(join(tmpdir(), 'acpmux-fake-tx-'));
   const path = join(dir, 'acpmux');
@@ -38,8 +40,11 @@ let buf = '';
 let rid = 7001;
 let promptId = null;
 const order = [];
+const requests = [];
+if (reverse.argsFile) fs.writeFileSync(reverse.argsFile, JSON.stringify(process.argv.slice(2)));
 function finish() {
   fs.writeFileSync(reverse.orderFile, JSON.stringify(order));
+  if (reverse.requestsFile) fs.writeFileSync(reverse.requestsFile, JSON.stringify(requests));
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: promptId, result: { stopReason: 'end_turn' } }) + '\\n');
 }
 process.stdin.on('data', (d) => {
@@ -52,10 +57,13 @@ process.stdin.on('data', (d) => {
     let msg;
     try { msg = JSON.parse(line); } catch { continue; }
     if (msg.method) order.push(msg.method);
+    if (msg.method) requests.push({ method: msg.method, params: msg.params });
     if (msg.method === 'initialize') {
       process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } }) + '\\n');
     } else if (msg.method === 'session/new') {
       process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's1' } }) + '\\n');
+    } else if (msg.method === 'session/set_mode') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { modeId: msg.params && msg.params.modeId } }) + '\\n');
     } else if (msg.method === 'session/set_config_option') {
       process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
     } else if (msg.method === 'session/prompt') {
@@ -198,5 +206,69 @@ describe('ACPTurn — reverse fs / permission handling (bidirectional ACP)', () 
     const promptIdx = order.indexOf('session/prompt');
     expect(cfgIdx).toBeGreaterThanOrEqual(0);
     expect(cfgIdx).toBeLessThan(promptIdx);
+  }, 15000);
+
+  it('passes provider args through acpmux for the selected provider', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'acp-cwd-'));
+    const respFile = join(cwd, 'resp.json');
+    const orderFile = join(cwd, 'order.json');
+    const argsFile = join(cwd, 'args.json');
+    const acpmux = writeFakeAcpmux({
+      method: 'session/request_permission',
+      params: { options: [{ optionId: 'allow' }] },
+      respFile,
+      orderFile,
+      argsFile,
+    });
+    const turn = new ACPTurn({
+      provider: 'claude',
+      acpmuxPath: acpmux,
+      cwd,
+      providerArgs: ['--permission-mode', 'bypassPermissions'],
+    });
+    await turn.run('x', () => {});
+    expect(JSON.parse(readFileSync(argsFile, 'utf8'))).toEqual([
+      '--provider',
+      'claude',
+      '--provider-arg',
+      '--permission-mode',
+      '--provider-arg',
+      'bypassPermissions',
+    ]);
+  }, 15000);
+
+  it('sends session/set_mode(yolo) after session/new and BEFORE session/prompt', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'acp-cwd-'));
+    const respFile = join(cwd, 'resp.json');
+    const orderFile = join(cwd, 'order.json');
+    const requestsFile = join(cwd, 'requests.json');
+    const acpmux = writeFakeAcpmux({
+      method: 'session/request_permission',
+      params: { options: [{ optionId: 'allow' }] },
+      respFile,
+      orderFile,
+      requestsFile,
+    });
+    const turn = new ACPTurn({
+      provider: 'codex',
+      acpmuxPath: acpmux,
+      cwd,
+      mode: 'yolo',
+    });
+    await turn.run('x', () => {});
+    const order = JSON.parse(readFileSync(orderFile, 'utf8')) as string[];
+    const newIdx = order.indexOf('session/new');
+    const modeIdx = order.indexOf('session/set_mode');
+    const promptIdx = order.indexOf('session/prompt');
+    expect(modeIdx).toBeGreaterThan(newIdx);
+    expect(modeIdx).toBeLessThan(promptIdx);
+
+    const requests = JSON.parse(readFileSync(requestsFile, 'utf8')) as Array<{
+      method: string;
+      params?: { modeId?: string };
+    }>;
+    expect(
+      requests.find((r) => r.method === 'session/set_mode')?.params?.modeId,
+    ).toBe('yolo');
   }, 15000);
 });

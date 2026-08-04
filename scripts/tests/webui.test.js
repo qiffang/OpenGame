@@ -43,6 +43,8 @@ afterEach(() => {
 const brokenCli = join(here, 'fixtures-webui-broken-cli.mjs');
 // A "CLI" that never exits, to exercise the timeout path.
 const hangCli = join(here, 'fixtures-webui-hang-cli.mjs');
+// A CLI that reports a terminal ACP error and then hangs. Web UI must fail fast.
+const acpErrorHangCli = join(here, 'fixtures-webui-acp-error-hang-cli.mjs');
 
 /** Start the webui server. By default it points at a deliberately-failing CLI so
  *  every generation fails at the generate stage. Pass { cli, timeoutMs } to
@@ -158,6 +160,30 @@ describe('webui error surface is child-safe', () => {
     }
     expect(terminal.message.length).toBeGreaterThan(0);
   }, 40000);
+
+  it('a terminal ACP child error fails fast instead of waiting for the full timeout', async () => {
+    const { base } = await startServer(8795, {
+      cli: acpErrorHangCli,
+      timeoutMs: 30000,
+    });
+    const res = await fetch(base + '/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: 'make a game' }),
+    });
+    const data = await res.json();
+    expect(res.status).toBe(202);
+
+    const started = Date.now();
+    const terminal = await pollUntilTerminal(base, data.job_id, 5000);
+    expect(Date.now() - started).toBeLessThan(10000);
+    expect(terminal.status).toBe('failed');
+    const blob = JSON.stringify(terminal).toLowerCase();
+    for (const forbidden of FORBIDDEN_ON_PAGE) {
+      expect(blob).not.toContain(forbidden.toLowerCase());
+    }
+    expect(terminal.message.length).toBeGreaterThan(0);
+  }, 15000);
 
   it('an unknown job id returns a clean not-found message', async () => {
     const { base } = await startServer(8793);
