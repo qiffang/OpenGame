@@ -8,6 +8,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const webui = join(here, '..', 'webui.mjs');
@@ -66,6 +67,7 @@ async function startServer(port, opts = {}) {
       ...(opts.attempts
         ? { OPENGAME_WEBUI_GENERATE_ATTEMPTS: String(opts.attempts) }
         : {}),
+      ...(opts.marker ? { OPENGAME_WEBUI_FIXTURE_MARKER: opts.marker } : {}),
     },
     stdio: 'ignore',
   });
@@ -196,6 +198,10 @@ describe('webui error surface is child-safe', () => {
       cli: acpErrorOnceCli,
       timeoutMs: 30000,
       attempts: 2,
+      marker: join(
+        tmpdir(),
+        `opengame-webui-retry-${process.pid}-${Date.now()}`,
+      ),
     });
     const res = await fetch(base + '/generate', {
       method: 'POST',
@@ -208,6 +214,10 @@ describe('webui error surface is child-safe', () => {
     const terminal = await pollUntilTerminal(base, data.job_id, 15000);
     expect(terminal.status).toBe('done');
     expect(terminal.game_url).toMatch(/^\/game\//);
+    const game = await fetch(base + terminal.game_url);
+    const html = await game.text();
+    expect(html).toContain('retry succeeded');
+    expect(html).not.toContain('stale attempt');
   }, 30000);
 
   it('an unknown job id returns a clean not-found message', async () => {

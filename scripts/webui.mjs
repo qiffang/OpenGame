@@ -291,7 +291,6 @@ function failJob(job, stage, detail) {
 /** Start a generation job in the background. Returns the job record immediately;
  *  the caller responds to the client without waiting for generation. */
 function startJob(prompt) {
-  const workspace = mkdtemp(join(tmpdir(), 'opengame-web-'));
   const job = {
     id: newId('gen'),
     status: 'running',
@@ -303,13 +302,13 @@ function startJob(prompt) {
   };
   jobs.set(job.id, job);
 
-  workspace
-    .then((ws) => runGeneration(job, ws, prompt))
+  runGeneration(job, prompt)
     .catch((e) => failJob(job, job.stage || 'starting', `unexpected: ${String(e)}`));
   return job;
 }
 
-function runGeneration(job, workspace, prompt, attempt = 1) {
+async function runGeneration(job, prompt, attempt = 1) {
+  const workspace = await mkdtemp(join(tmpdir(), 'opengame-web-'));
   job.stage = 'generate';
   jobLog(job, `workspace=${workspace}`);
   jobLog(job, `backend=ACP/${ACP_PROVIDER} (no API key)`);
@@ -365,7 +364,9 @@ function runGeneration(job, workspace, prompt, attempt = 1) {
           job,
           `retrying generate after terminal ACP error (${attempt + 1}/${GENERATE_ATTEMPTS})`,
         );
-        runGeneration(job, workspace, prompt, attempt + 1);
+        runGeneration(job, prompt, attempt + 1).catch((e) =>
+          failJob(job, 'generate', `retry setup failed: ${String(e)}`),
+        );
         return;
       }
       failJob(job, 'generate', `cli terminal error: ${terminalFailureLine}`);
