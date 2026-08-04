@@ -54,6 +54,18 @@ export class ACPError extends Error {
   }
 }
 
+/** True if an error is a JSON-RPC "method not found" (-32601) — i.e. the ACP
+ *  agent does not implement the method we called. Checks the preserved code in
+ *  ACPError.detail first, then falls back to the message text for agents that
+ *  omit a numeric code. */
+function isMethodNotFound(e: unknown): boolean {
+  if (e instanceof ACPError) {
+    if (e.detail && e.detail.includes('code=-32601')) return true;
+    return /method not found|unknown method|not supported/i.test(e.safeMessage);
+  }
+  return false;
+}
+
 interface JsonRpcResponse {
   jsonrpc: '2.0';
   id?: number | string;
@@ -140,14 +152,24 @@ export class ACPTurn {
         sessionId: string;
       };
       if (this.config.mode) {
-        await this.#rpc(
-          'session/set_mode',
-          {
-            sessionId: session.sessionId,
-            modeId: this.config.mode,
-          },
-          signal,
-        );
+        // session/set_mode is BEST-EFFORT: not every ACP agent implements it.
+        // An agent that doesn't returns JSON-RPC "method not found", which must
+        // NOT fail the whole turn — permission bypass is already carried by the
+        // spawn arg `--permission-mode bypassPermissions`, and set_mode is just
+        // belt-and-suspenders on top of it. Tolerate method-not-found; rethrow
+        // anything else.
+        try {
+          await this.#rpc(
+            'session/set_mode',
+            {
+              sessionId: session.sessionId,
+              modeId: this.config.mode,
+            },
+            signal,
+          );
+        } catch (e) {
+          if (!isMethodNotFound(e)) throw e;
+        }
       }
       // acpmux takes the model via session/set_config_option (configId "model"),
       // NOT session/new — set it here so OPENGAME_ACP_MODEL actually reaches the
@@ -253,8 +275,14 @@ export class ACPTurn {
       if (!pending) return;
       this.#pending.delete(msg.id);
       if (msg.error) {
+        // Preserve the JSON-RPC error code in `detail` so callers can classify
+        // (e.g. -32601 method-not-found) without brittle message matching.
         pending.reject(
-          new ACPError('turn_failed', `ACP RPC error: ${msg.error.message}`),
+          new ACPError(
+            'turn_failed',
+            `ACP RPC error: ${msg.error.message}`,
+            msg.error.code === undefined ? undefined : `code=${msg.error.code}`,
+          ),
         );
       } else {
         pending.resolve(msg.result);
