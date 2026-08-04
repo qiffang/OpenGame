@@ -8,6 +8,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const webui = join(here, '..', 'webui.mjs');
@@ -45,6 +46,8 @@ const brokenCli = join(here, 'fixtures-webui-broken-cli.mjs');
 const hangCli = join(here, 'fixtures-webui-hang-cli.mjs');
 // A CLI that reports a terminal ACP error and then hangs. Web UI must fail fast.
 const acpErrorHangCli = join(here, 'fixtures-webui-acp-error-hang-cli.mjs');
+// A CLI that reports one transient ACP stream error, then writes a game.
+const acpErrorOnceCli = join(here, 'fixtures-webui-acp-error-once-cli.mjs');
 
 /** Start the webui server. By default it points at a deliberately-failing CLI so
  *  every generation fails at the generate stage. Pass { cli, timeoutMs } to
@@ -61,6 +64,10 @@ async function startServer(port, opts = {}) {
       ...(opts.timeoutMs
         ? { OPENGAME_WEBUI_TIMEOUT_MS: String(opts.timeoutMs) }
         : {}),
+      ...(opts.attempts
+        ? { OPENGAME_WEBUI_GENERATE_ATTEMPTS: String(opts.attempts) }
+        : {}),
+      ...(opts.marker ? { OPENGAME_WEBUI_FIXTURE_MARKER: opts.marker } : {}),
     },
     stdio: 'ignore',
   });
@@ -165,6 +172,7 @@ describe('webui error surface is child-safe', () => {
     const { base } = await startServer(8795, {
       cli: acpErrorHangCli,
       timeoutMs: 30000,
+      attempts: 1,
     });
     const res = await fetch(base + '/generate', {
       method: 'POST',
@@ -184,6 +192,33 @@ describe('webui error surface is child-safe', () => {
     }
     expect(terminal.message.length).toBeGreaterThan(0);
   }, 15000);
+
+  it('a transient ACP stream disconnect is retried before failing the job', async () => {
+    const { base } = await startServer(8796, {
+      cli: acpErrorOnceCli,
+      timeoutMs: 30000,
+      attempts: 2,
+      marker: join(
+        tmpdir(),
+        `opengame-webui-retry-${process.pid}-${Date.now()}`,
+      ),
+    });
+    const res = await fetch(base + '/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: 'make a game' }),
+    });
+    const data = await res.json();
+    expect(res.status).toBe(202);
+
+    const terminal = await pollUntilTerminal(base, data.job_id, 15000);
+    expect(terminal.status).toBe('done');
+    expect(terminal.game_url).toMatch(/^\/game\//);
+    const game = await fetch(base + terminal.game_url);
+    const html = await game.text();
+    expect(html).toContain('retry succeeded');
+    expect(html).not.toContain('stale attempt');
+  }, 30000);
 
   it('an unknown job id returns a clean not-found message', async () => {
     const { base } = await startServer(8793);

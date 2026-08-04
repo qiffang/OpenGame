@@ -30,6 +30,7 @@ function writeFakeAcpmux(reverse: {
   orderFile: string;
   argsFile?: string;
   requestsFile?: string;
+  setModeError?: { code: number; message: string };
 }): string {
   const dir = mkdtempSync(join(tmpdir(), 'acpmux-fake-tx-'));
   const path = join(dir, 'acpmux');
@@ -63,7 +64,11 @@ process.stdin.on('data', (d) => {
     } else if (msg.method === 'session/new') {
       process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's1' } }) + '\\n');
     } else if (msg.method === 'session/set_mode') {
-      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { modeId: msg.params && msg.params.modeId } }) + '\\n');
+      if (reverse.setModeError) {
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, error: reverse.setModeError }) + '\\n');
+      } else {
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { modeId: msg.params && msg.params.modeId } }) + '\\n');
+      }
     } else if (msg.method === 'session/set_config_option') {
       process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
     } else if (msg.method === 'session/prompt') {
@@ -270,5 +275,53 @@ describe('ACPTurn — reverse fs / permission handling (bidirectional ACP)', () 
     expect(
       requests.find((r) => r.method === 'session/set_mode')?.params?.modeId,
     ).toBe('yolo');
+  }, 15000);
+
+  it('continues when session/set_mode is not implemented by the ACP agent', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'acp-cwd-'));
+    const respFile = join(cwd, 'resp.json');
+    const orderFile = join(cwd, 'order.json');
+    const acpmux = writeFakeAcpmux({
+      method: 'session/request_permission',
+      params: { options: [{ optionId: 'allow' }] },
+      respFile,
+      orderFile,
+      setModeError: {
+        code: -32601,
+        message: 'method not found: session/set_mode',
+      },
+    });
+    const turn = new ACPTurn({
+      provider: 'codex',
+      acpmuxPath: acpmux,
+      cwd,
+      mode: 'yolo',
+    });
+    await turn.run('x', () => {});
+    const order = JSON.parse(readFileSync(orderFile, 'utf8')) as string[];
+    expect(order).toContain('session/set_mode');
+    expect(order).toContain('session/prompt');
+  }, 15000);
+
+  it('fails closed for non-compatibility errors from session/set_mode', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'acp-cwd-'));
+    const respFile = join(cwd, 'resp.json');
+    const orderFile = join(cwd, 'order.json');
+    const acpmux = writeFakeAcpmux({
+      method: 'session/request_permission',
+      params: { options: [{ optionId: 'allow' }] },
+      respFile,
+      orderFile,
+      setModeError: { code: -32000, message: 'internal mode error' },
+    });
+    const turn = new ACPTurn({
+      provider: 'codex',
+      acpmuxPath: acpmux,
+      cwd,
+      mode: 'yolo',
+    });
+    await expect(turn.run('x', () => {})).rejects.toMatchObject({
+      category: 'turn_failed',
+    });
   }, 15000);
 });

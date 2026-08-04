@@ -52,8 +52,12 @@ const ACP_PROVIDER = process.env['OPENGAME_ACP_PROVIDER'] || 'claude';
 const GEN_TIMEOUT_MS = Number(
   process.env['OPENGAME_WEBUI_TIMEOUT_MS'] || 8 * 60 * 1000,
 );
+const GENERATE_ATTEMPTS = Number(
+  process.env['OPENGAME_WEBUI_GENERATE_ATTEMPTS'] || 3,
+);
 const TERMINAL_CLI_ERROR_RE =
   /Connection closed mid-response|ACP turn ended with an error/i;
+const RETRYABLE_CLI_ERROR_RE = /Connection closed mid-response/i;
 
 // job_id → job record. `log` and `detail` are OPERATOR-ONLY (never sent to the
 // page). `stage`/`status`/`message`/`diagnosticId`/`gameUrl` are page-safe.
@@ -287,7 +291,6 @@ function failJob(job, stage, detail) {
 /** Start a generation job in the background. Returns the job record immediately;
  *  the caller responds to the client without waiting for generation. */
 function startJob(prompt) {
-  const workspace = mkdtemp(join(tmpdir(), 'opengame-web-'));
   const job = {
     id: newId('gen'),
     status: 'running',
@@ -299,16 +302,17 @@ function startJob(prompt) {
   };
   jobs.set(job.id, job);
 
-  workspace
-    .then((ws) => runGeneration(job, ws, prompt))
+  runGeneration(job, prompt)
     .catch((e) => failJob(job, job.stage || 'starting', `unexpected: ${String(e)}`));
   return job;
 }
 
-function runGeneration(job, workspace, prompt) {
+async function runGeneration(job, prompt, attempt = 1) {
+  const workspace = await mkdtemp(join(tmpdir(), 'opengame-web-'));
   job.stage = 'generate';
   jobLog(job, `workspace=${workspace}`);
   jobLog(job, `backend=ACP/${ACP_PROVIDER} (no API key)`);
+  jobLog(job, `generate attempt=${attempt}/${GENERATE_ATTEMPTS}`);
 
   const env = {
     ...process.env,
@@ -322,6 +326,7 @@ function runGeneration(job, workspace, prompt) {
 
   let timedOut = false;
   let terminalFailure = false;
+  let terminalFailureLine = '';
   const timer = setTimeout(() => {
     timedOut = true;
     child.kill('SIGKILL');
@@ -333,8 +338,8 @@ function runGeneration(job, workspace, prompt) {
       jobLog(job, `cli: ${line}`);
       if (!terminalFailure && TERMINAL_CLI_ERROR_RE.test(line)) {
         terminalFailure = true;
+        terminalFailureLine = line;
         clearTimeout(timer);
-        failJob(job, 'generate', `cli terminal error: ${line}`);
         child.kill('SIGKILL');
       }
     }
@@ -350,7 +355,23 @@ function runGeneration(job, workspace, prompt) {
 
   child.on('close', async (code) => {
     clearTimeout(timer);
-    if (terminalFailure) return;
+    if (terminalFailure) {
+      if (
+        RETRYABLE_CLI_ERROR_RE.test(terminalFailureLine) &&
+        attempt < GENERATE_ATTEMPTS
+      ) {
+        jobLog(
+          job,
+          `retrying generate after terminal ACP error (${attempt + 1}/${GENERATE_ATTEMPTS})`,
+        );
+        runGeneration(job, prompt, attempt + 1).catch((e) =>
+          failJob(job, 'generate', `retry setup failed: ${String(e)}`),
+        );
+        return;
+      }
+      failJob(job, 'generate', `cli terminal error: ${terminalFailureLine}`);
+      return;
+    }
     if (timedOut) {
       failJob(job, 'generate', `timeout after ${GEN_TIMEOUT_MS}ms`);
       return;
