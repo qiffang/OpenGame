@@ -12,6 +12,11 @@ const fakeConfig = {
   getProxy: () => undefined,
 } as unknown as Config;
 
+const fakeYoloConfig = {
+  getProxy: () => undefined,
+  getApprovalMode: () => 'yolo',
+} as unknown as Config;
+
 const OPENAI_VARS = ['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_MODEL'];
 const ACP_VARS = [
   'OPENGAME_ACP_PROVIDER',
@@ -83,6 +88,17 @@ describe('createContentGeneratorConfig — ACP no-key gate (contract #1)', () =>
     const cfg = createContentGeneratorConfig(fakeConfig, AuthType.USE_ACP);
     expect(cfg.acp?.acpmuxPath).toBe('/opt/acpmux');
     expect(cfg.acp?.model).toBe('claude-sonnet');
+  });
+
+  it('passes Claude provider permission-bypass args when ACP runs in yolo mode', () => {
+    process.env['OPENGAME_ACP_PROVIDER'] = 'claude';
+    const cfg = createContentGeneratorConfig(fakeYoloConfig, AuthType.USE_ACP);
+    expect(cfg.acp?.provider).toBe('claude');
+    expect(cfg.acp?.mode).toBe('yolo');
+    expect(cfg.acp?.providerArgs).toEqual([
+      '--permission-mode',
+      'bypassPermissions',
+    ]);
   });
 
   it('fails closed on an unsupported provider (no silent fallback)', () => {

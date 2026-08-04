@@ -61,8 +61,10 @@ export class ACPContentGenerator implements ContentGenerator {
     const turn = new ACPTurn({
       provider: acp.provider,
       acpmuxPath: acp.acpmuxPath,
+      providerArgs: acp.providerArgs,
       cwd: this.gcConfig.getWorkingDir(),
       model: acp.model,
+      mode: acp.mode,
     });
 
     const abortSignal = (request.config as { abortSignal?: AbortSignal })
@@ -84,6 +86,8 @@ export class ACPContentGenerator implements ContentGenerator {
     const prompt = flattenRequestToPrompt(request);
     const cwd = this.gcConfig.getWorkingDir();
     const model = acp.model;
+    const providerArgs = acp.providerArgs;
+    const mode = acp.mode;
     const abortSignal = (request.config as { abortSignal?: AbortSignal })
       ?.abortSignal;
 
@@ -98,8 +102,10 @@ export class ACPContentGenerator implements ContentGenerator {
       const turn = new ACPTurn({
         provider: acp.provider,
         acpmuxPath: acp.acpmuxPath,
+        providerArgs,
         cwd,
         model,
+        mode,
       });
       const runPromise = turn
         .run(

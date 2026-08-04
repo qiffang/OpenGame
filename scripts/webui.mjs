@@ -52,6 +52,8 @@ const ACP_PROVIDER = process.env['OPENGAME_ACP_PROVIDER'] || 'claude';
 const GEN_TIMEOUT_MS = Number(
   process.env['OPENGAME_WEBUI_TIMEOUT_MS'] || 8 * 60 * 1000,
 );
+const TERMINAL_CLI_ERROR_RE =
+  /Connection closed mid-response|ACP turn ended with an error/i;
 
 // job_id → job record. `log` and `detail` are OPERATOR-ONLY (never sent to the
 // page). `stage`/`status`/`message`/`diagnosticId`/`gameUrl` are page-safe.
@@ -319,6 +321,7 @@ function runGeneration(job, workspace, prompt) {
   });
 
   let timedOut = false;
+  let terminalFailure = false;
   const timer = setTimeout(() => {
     timedOut = true;
     child.kill('SIGKILL');
@@ -326,7 +329,14 @@ function runGeneration(job, workspace, prompt) {
 
   const relay = (buf) => {
     for (const line of buf.toString('utf8').split('\n')) {
-      if (line.trim()) jobLog(job, `cli: ${line}`);
+      if (!line.trim()) continue;
+      jobLog(job, `cli: ${line}`);
+      if (!terminalFailure && TERMINAL_CLI_ERROR_RE.test(line)) {
+        terminalFailure = true;
+        clearTimeout(timer);
+        failJob(job, 'generate', `cli terminal error: ${line}`);
+        child.kill('SIGKILL');
+      }
     }
   };
   child.stdout.on('data', relay);
@@ -340,6 +350,7 @@ function runGeneration(job, workspace, prompt) {
 
   child.on('close', async (code) => {
     clearTimeout(timer);
+    if (terminalFailure) return;
     if (timedOut) {
       failJob(job, 'generate', `timeout after ${GEN_TIMEOUT_MS}ms`);
       return;
